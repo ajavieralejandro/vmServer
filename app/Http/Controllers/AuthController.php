@@ -3,6 +3,7 @@
 namespace App\Http\Controllers;
 
 use App\Models\User;
+use App\Models\SocioPadron;
 use App\Services\SociosApi;
 use Carbon\Carbon;
 use Illuminate\Http\Request;
@@ -23,8 +24,6 @@ class AuthController extends Controller
             'password' => 'required|string',
         ]);
 
-	
-
         $dni  = trim($data['dni']);
         $pass = $data['password'];
 
@@ -32,35 +31,44 @@ class AuthController extends Controller
         $user = User::where('dni', $dni)->first();
 
         if ($user) {
-            // Verificamos password local
             if (!Hash::check($pass, $user->password)) {
                 throw ValidationException::withMessages([
                     'password' => ['Credenciales inválidas.'],
                 ]);
             }
 
-            // (Opcional) Refrescar datos si la API trae update_ts más nuevo
+            // Intentar refrescar (pero ojo: get_socio no trae nombre; igual puede traer barcode/saldo/semaforo)
             $this->maybeRefreshFromApi($user, $api);
+
+            // Completar desde padrón local si faltan datos
+            $this->fillFromPadronIfMissing($user);
 
             return response()->json([
                 'token' => $user->createToken('auth')->plainTextToken,
                 'user'  => $user->fresh(),
                 'fetched_from_api' => false,
-                'refreshed' => (bool) $user->wasChanged(), // true si actualizó algo
+                'refreshed' => false,
             ]);
         }
 
-        // 2) No existe local: buscamos en API
+        // 2) No existe local: buscamos en API (get_socio es pobre, pero al menos confirma acceso)
         $socio = $api->getSocioPorDni($dni);
         if (!$socio) {
+            // Si el proveedor falla, esto puede ser 500. A futuro: devolver 503.
             throw ValidationException::withMessages([
-                'dni' => ['No se encontró el socio por DNI.'],
+                'dni' => ['No se encontró el socio por DNI o el servicio no responde.'],
             ]);
         }
 
-        // 3) Crear usuario local a partir de la API
+        // 3) Creamos usuario local con lo mínimo
         $attrs = $this->mapSocioToUserAttributes($socio, $dni, $pass);
-        $avatarPath = $this->downloadAndStoreAvatar($api, (string)($socio['Id'] ?? $socio['socio_n'] ?? ''));
+
+        // 4) Completar desde padrón local (DNI -> apynom/sid/barcode/saldo/semaforo)
+        $attrs = $this->mergeAttrsFromPadron($attrs, $dni);
+
+        // 5) Descargar avatar si tenemos un ID utilizable (sid del padrón)
+        $socioIdForPhoto = (string)($attrs['socio_id'] ?? '');
+        $avatarPath = $this->downloadAndStoreAvatar($api, $socioIdForPhoto);
         if ($avatarPath) {
             $attrs['avatar_path'] = $avatarPath;
         }
@@ -92,30 +100,27 @@ class AuthController extends Controller
     }
 
     /**
-     * Si la API trae un update_ts más nuevo que api_update_ts local,
-     * actualiza campos e imagen.
+     * Refresca datos desde API si hubiese update_ts.
+     * (Ojo: tu get_socio actual no trae update_ts ni nombre, pero lo dejamos por compatibilidad.)
      */
     protected function maybeRefreshFromApi(User $user, SociosApi $api): void
     {
         $socio = $api->getSocioPorDni($user->dni);
         if (!$socio) return;
 
-        $apiTsStr = $socio['update_ts'] ?? null; // ejemplo "2025-09-01 03:01:54"
+        $apiTsStr = $socio['update_ts'] ?? null;
         $apiTs = $apiTsStr ? Carbon::parse($apiTsStr) : null;
 
-        // Si no hay update_ts en API, no refrescamos para evitar sobreescrituras innecesarias
         if (!$apiTs) return;
 
         $localTs = $user->api_update_ts ? Carbon::parse($user->api_update_ts) : null;
         if ($localTs && $apiTs->lte($localTs)) {
-            return; // local ya está actualizado
+            return;
         }
 
-        // Mapear y actualizar
-        $attrs = $this->mapSocioToUserAttributes($socio, $user->dni, null, /*isNew=*/false);
+        $attrs = $this->mapSocioToUserAttributes($socio, $user->dni, null, false);
 
-        // Re-descargar foto por si cambió
-        $socioId = (string)($socio['Id'] ?? $socio['socio_n'] ?? '');
+        $socioId = (string)($attrs['socio_id'] ?? '');
         if ($socioId !== '') {
             if ($binary = $api->fetchFotoSocio($socioId)) {
                 $file = "socios/{$socioId}.jpg";
@@ -130,7 +135,7 @@ class AuthController extends Controller
 
     /**
      * Mapea el payload del socio (API) a los atributos del User local.
-     * Si $isNew es true, también setea password.
+     * Tu get_socio hoy solo trae barcode/saldo/semaforo, así que name cae en DNI.
      */
     protected function mapSocioToUserAttributes(array $socio, string $dni, ?string $plainPassword, bool $isNew = true): array
     {
@@ -138,10 +143,14 @@ class AuthController extends Controller
         $apellido = trim((string)($socio['apellido'] ?? ''));
         $email    = $socio['mail'] ?? null;
 
+        $socioIdRaw = $socio['Id'] ?? $socio['socio_n'] ?? null;
+        $socioId = ($socioIdRaw !== null && $socioIdRaw !== '') ? (string)$socioIdRaw : null;
+
         $attrs = [
             'dni'          => $dni,
-            'name'         => ($apellido || $nombre) ? "{$apellido}, {$nombre}" : $dni,
+            'name'         => ($apellido || $nombre) ? trim("{$apellido}, {$nombre}", " ,") : $dni,
             'email'        => $email ?: null,
+
             'nombre'       => $nombre ?: null,
             'apellido'     => $apellido ?: null,
             'nacionalidad' => $socio['nacionalidad'] ?? null,
@@ -151,7 +160,8 @@ class AuthController extends Controller
             'telefono'     => $socio['telefono'] ?? null,
             'celular'      => $socio['celular'] ?? null,
             'categoria'    => $socio['categoria'] ?? null,
-            'socio_id'     => (string)($socio['Id'] ?? $socio['socio_n'] ?? null),
+
+            'socio_id'     => $socioId,
             'barcode'      => $socio['barcode'] ?? null,
             'estado_socio' => $socio['estado'] ?? null,
             'api_update_ts'=> ($socio['update_ts'] ?? null) ? Carbon::parse($socio['update_ts']) : now(),
@@ -159,6 +169,70 @@ class AuthController extends Controller
 
         if ($isNew && $plainPassword !== null) {
             $attrs['password'] = Hash::make($plainPassword);
+        }
+
+        return $attrs;
+    }
+
+    /**
+     * Completa un User ya existente con datos del padrón local si faltan.
+     */
+    protected function fillFromPadronIfMissing(User $user): void
+    {
+        if (!class_exists(SocioPadron::class)) {
+            return;
+        }
+
+        $pad = SocioPadron::where('dni', $user->dni)->first();
+        if (!$pad) return;
+
+        $changed = false;
+
+        if (($user->name === $user->dni || !$user->name) && $pad->apynom) {
+            $user->name = $pad->apynom;
+            $changed = true;
+        }
+
+        if (empty($user->socio_id) && !empty($pad->sid)) {
+            $user->socio_id = (string)$pad->sid;
+            $changed = true;
+        }
+
+        if (empty($user->barcode) && !empty($pad->barcode)) {
+            $user->barcode = $pad->barcode;
+            $changed = true;
+        }
+
+        if ($changed) {
+            $user->save();
+        }
+    }
+
+    /**
+     * Mezcla attrs con padrón local ANTES de crear user
+     */
+    protected function mergeAttrsFromPadron(array $attrs, string $dni): array
+    {
+        if (!class_exists(SocioPadron::class)) {
+            return $attrs;
+        }
+
+        $pad = SocioPadron::where('dni', $dni)->first();
+        if (!$pad) return $attrs;
+
+        // name: apynom viene "APELLIDO NOMBRE"
+        if (($attrs['name'] ?? $dni) === $dni && !empty($pad->apynom)) {
+            $attrs['name'] = $pad->apynom;
+        }
+
+        // socio_id: usamos sid
+        if (empty($attrs['socio_id']) && !empty($pad->sid)) {
+            $attrs['socio_id'] = (string)$pad->sid;
+        }
+
+        // barcode
+        if (empty($attrs['barcode']) && !empty($pad->barcode)) {
+            $attrs['barcode'] = $pad->barcode;
         }
 
         return $attrs;

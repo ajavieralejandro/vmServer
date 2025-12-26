@@ -117,6 +117,32 @@ class SociosApi
         return $json;
     }
 
+    public function getPadronFull(): ?array
+{
+    $url = "{$this->base}/get_padron_full";
+
+    $resp = Http::withOptions([
+            'timeout' => $this->timeout,
+            'verify'  => $this->verify,
+        ])
+        ->withHeaders([
+            'Authorization' => $this->token,
+            'Login'         => $this->login,
+            'Accept'        => 'application/json',
+        ])
+        ->get($url);
+
+    $json = $this->decodeAndLog('padron_full', $url, $resp);
+
+    if (!$json) return null;
+    if (!empty($json['result']) && is_array($json['result'])) {
+        return $json['result'];
+    }
+
+    return null;
+}
+
+
     public function fetchFotoSocio(string $socioId): ?string
     {
         if ($this->imgBase === '' || $socioId === '') return null;

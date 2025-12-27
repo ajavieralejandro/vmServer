@@ -1,13 +1,15 @@
 <?php
 
 use Illuminate\Database\Migrations\Migration;
+use Illuminate\Database\Schema\Blueprint;
 use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Facades\Schema;
 
 return new class extends Migration
 {
     public function up(): void
     {
-        // Ajustá tamaños si querés (64 suele sobrar)
+        // Cambios de columnas
         DB::statement("
             ALTER TABLE socios_padron
             MODIFY dni VARCHAR(16) NOT NULL,
@@ -21,14 +23,23 @@ return new class extends Migration
             MODIFY raw JSON NULL
         ");
 
-        // Asegurá unique por dni (si no existe)
-        // Si ya existe un unique con otro nombre, esto puede fallar: en ese caso lo vemos.
-        DB::statement("ALTER TABLE socios_padron ADD UNIQUE KEY socios_padron_dni_unique (dni)");
+        // Crear UNIQUE(dni) solo si no existe
+        $exists = DB::select("
+            SHOW INDEX FROM socios_padron
+            WHERE Key_name = 'socios_padron_dni_unique'
+        ");
+
+        if (empty($exists)) {
+            Schema::table('socios_padron', function (Blueprint $table) {
+                $table->unique('dni', 'socios_padron_dni_unique');
+            });
+        }
     }
 
     public function down(): void
     {
-        // No recomiendo volver a BIGINT porque perderías datos (barcodes gigantes).
-        // Dejamos sin revert para evitar romper.
+        // No revertimos tipos ni índices:
+        // - Podría perderse información (barcode/sid)
+        // - Evitamos romper datos históricos
     }
 };

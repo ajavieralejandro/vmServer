@@ -3,7 +3,8 @@
 use Illuminate\Database\Migrations\Migration;
 use Illuminate\Support\Facades\DB;
 
-return new class extends Migration {
+return new class extends Migration
+{
     public function up(): void
     {
         DB::statement("
@@ -19,15 +20,24 @@ return new class extends Migration {
             MODIFY raw JSON NULL
         ");
 
-        // si existe el índice con ese nombre, lo borro
-        $idx = DB::selectOne("SHOW INDEX FROM socios_padron WHERE Key_name = 'socios_padron_dni_unique' LIMIT 1");
-        if ($idx) {
-            DB::statement("ALTER TABLE socios_padron DROP INDEX socios_padron_dni_unique");
-        }
+        // ¿Ya existe algún UNIQUE sobre la columna dni?
+        $hasUniqueOnDni = DB::selectOne("
+            SELECT 1
+            FROM information_schema.statistics
+            WHERE table_schema = DATABASE()
+              AND table_name   = 'socios_padron'
+              AND column_name  = 'dni'
+              AND non_unique   = 0
+            LIMIT 1
+        ");
 
-        // lo creo de nuevo (limpio)
-        DB::statement("ALTER TABLE socios_padron ADD UNIQUE KEY socios_padron_dni_unique (dni)");
+        if (!$hasUniqueOnDni) {
+            DB::statement("ALTER TABLE socios_padron ADD UNIQUE KEY socios_padron_dni_unique (dni)");
+        }
     }
 
-    public function down(): void {}
+    public function down(): void
+    {
+        // intencionalmente vacío
+    }
 };

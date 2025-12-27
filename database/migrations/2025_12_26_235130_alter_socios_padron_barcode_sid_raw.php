@@ -1,15 +1,11 @@
 <?php
 
 use Illuminate\Database\Migrations\Migration;
-use Illuminate\Database\Schema\Blueprint;
 use Illuminate\Support\Facades\DB;
-use Illuminate\Support\Facades\Schema;
 
-return new class extends Migration
-{
+return new class extends Migration {
     public function up(): void
     {
-        // Cambios de columnas
         DB::statement("
             ALTER TABLE socios_padron
             MODIFY dni VARCHAR(16) NOT NULL,
@@ -23,23 +19,15 @@ return new class extends Migration
             MODIFY raw JSON NULL
         ");
 
-        // Crear UNIQUE(dni) solo si no existe
-        $exists = DB::select("
-            SHOW INDEX FROM socios_padron
-            WHERE Key_name = 'socios_padron_dni_unique'
-        ");
-
-        if (empty($exists)) {
-            Schema::table('socios_padron', function (Blueprint $table) {
-                $table->unique('dni', 'socios_padron_dni_unique');
-            });
+        // si existe el índice con ese nombre, lo borro
+        $idx = DB::selectOne("SHOW INDEX FROM socios_padron WHERE Key_name = 'socios_padron_dni_unique' LIMIT 1");
+        if ($idx) {
+            DB::statement("ALTER TABLE socios_padron DROP INDEX socios_padron_dni_unique");
         }
+
+        // lo creo de nuevo (limpio)
+        DB::statement("ALTER TABLE socios_padron ADD UNIQUE KEY socios_padron_dni_unique (dni)");
     }
 
-    public function down(): void
-    {
-        // No revertimos tipos ni índices:
-        // - Podría perderse información (barcode/sid)
-        // - Evitamos romper datos históricos
-    }
+    public function down(): void {}
 };

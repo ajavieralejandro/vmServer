@@ -21,6 +21,11 @@ return [
     'resend' => [
         'key' => env('RESEND_KEY'),
     ],
+    'piletas' => [
+    'internal_url' => env('PILETAS_INTERNAL_URL'),
+    'internal_key' => env('PILETAS_INTERNAL_KEY'),
+],
+
 
     'ses' => [
         'key' => env('AWS_ACCESS_KEY_ID'),

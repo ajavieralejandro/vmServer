@@ -11,6 +11,11 @@ use Illuminate\Support\Facades\Hash;
 use Illuminate\Support\Facades\Storage;
 use Illuminate\Validation\ValidationException;
 
+// ✅ Para reset por email (Laravel Password Broker)
+use Illuminate\Support\Facades\Password;
+use Illuminate\Support\Str;
+use Illuminate\Auth\Events\PasswordReset;
+
 class AuthController extends Controller
 {
     /**
@@ -45,10 +50,6 @@ class AuthController extends Controller
                 $this->fillFromPadronIfMissing($user, $pad);
             }
 
-            // API opcional: si querés, SOLO para foto o refresh eventual.
-            // Recomendación: NO bloquear login si falla la API.
-            // $this->maybeRefreshFromApi($user, $api);
-
             return response()->json([
                 'token' => $user->createToken('auth')->plainTextToken,
                 'user'  => $user->fresh(),
@@ -59,11 +60,12 @@ class AuthController extends Controller
 
         /**
          * 2) No existe user local:
-         *    - Si está en padrón => crearlo desde padrón
-         *    - Si NO está en padrón => fallback a API (opcional)
+         *    - Si está en padrón => crearlo desde padrón (password inicial = DNI)
+         *    - Si NO está en padrón => fallback a API (password inicial = DNI)
          */
 
         if ($pad) {
+            // ⚠️ password inicial = DNI (ignora lo que tipeó el usuario)
             $attrs = $this->mapPadronToUserAttributes($pad, $dni, $pass);
 
             // (Opcional) bajar foto si querés (usa sid)
@@ -92,6 +94,7 @@ class AuthController extends Controller
             ]);
         }
 
+        // ⚠️ password inicial = DNI (ignora lo que tipeó el usuario)
         $attrs = $this->mapSocioToUserAttributes($socio, $dni, $pass);
 
         // Intentar enriquecer igual desde padrón si aparece (raro, pero por si tu sync está a medias)
@@ -117,6 +120,132 @@ class AuthController extends Controller
         ], 201);
     }
 
+    /**
+     * POST /api/auth/register
+     * Body: { dni, name, email, password, password_confirmation }
+     * Registro para NO socios
+     */
+    public function register(Request $request)
+    {
+        $data = $request->validate([
+            // Asumo que tu users.dni es required. Si es nullable, avisame y lo ajusto.
+            'dni'      => 'required|string|unique:users,dni',
+            'name'     => 'required|string|max:255',
+            'email'    => 'required|email:rfc,dns|max:255|unique:users,email',
+            'password' => 'required|string|min:6|confirmed',
+        ]);
+
+        // No permitir que un socio del padrón se registre como "no-socio"
+        if (SocioPadron::where('dni', $data['dni'])->exists()) {
+            throw ValidationException::withMessages([
+                'dni' => ['Ese DNI pertenece a un socio. Ingresá con DNI como contraseña inicial.'],
+            ]);
+        }
+
+        $user = User::create([
+            'dni'      => trim((string)$data['dni']),
+            'name'     => (string)$data['name'],
+            'email'    => (string)$data['email'],
+            'password' => Hash::make((string)$data['password']),
+            'is_admin' => false,
+        ]);
+
+        return response()->json([
+            'token'  => $user->createToken('auth')->plainTextToken,
+            'user'   => $user->fresh(),
+            'source' => 'register',
+        ], 201);
+    }
+
+    /**
+     * POST /api/auth/change-password (logueado)
+     * Body: { current_password, new_password, new_password_confirmation }
+     */
+    public function changePassword(Request $request)
+    {
+        $user = $request->user();
+
+        $data = $request->validate([
+            'current_password' => 'required|string',
+            'new_password'     => 'required|string|min:6|confirmed',
+        ]);
+
+        if (!Hash::check($data['current_password'], $user->password)) {
+            throw ValidationException::withMessages([
+                'current_password' => ['La contraseña actual no es correcta.'],
+            ]);
+        }
+
+        $user->password = Hash::make((string)$data['new_password']);
+        $user->save();
+
+        // 🔒 Recomendado en apps: revocar tokens para que re-loguee
+        // (si lo activás, el front tiene que borrar token y mandar a Login)
+        // $user->tokens()->delete();
+
+        return response()->json(['ok' => true]);
+    }
+
+    /**
+     * POST /api/auth/forgot-password
+     * Body: { email }
+     * Envía mail con token de reset (Laravel Password Broker)
+     */
+    public function forgotPassword(Request $request)
+    {
+        $data = $request->validate([
+            'email' => 'required|email',
+        ]);
+
+        $status = Password::sendResetLink(['email' => (string)$data['email']]);
+
+        if ($status !== Password::RESET_LINK_SENT) {
+            throw ValidationException::withMessages([
+                'email' => [__($status)],
+            ]);
+        }
+
+        return response()->json(['ok' => true]);
+    }
+
+    /**
+     * POST /api/auth/reset-password
+     * Body: { email, token, password, password_confirmation }
+     */
+    public function resetPassword(Request $request)
+    {
+        $data = $request->validate([
+            'email'                 => 'required|email',
+            'token'                 => 'required|string',
+            'password'              => 'required|string|min:6|confirmed',
+        ]);
+
+        $status = Password::reset(
+            [
+                'email' => (string)$data['email'],
+                'token' => (string)$data['token'],
+                'password' => (string)$data['password'],
+                'password_confirmation' => (string)$data['password_confirmation'],
+            ],
+            function ($user, $password) {
+                $user->forceFill([
+                    'password' => Hash::make((string)$password),
+                    'remember_token' => Str::random(60),
+                ])->save();
+
+                event(new PasswordReset($user));
+            }
+        );
+
+        if ($status !== Password::PASSWORD_RESET) {
+            throw ValidationException::withMessages([
+                'email' => [__($status)],
+            ]);
+        }
+
+        return response()->json(['ok' => true]);
+    }
+
     public function me(Request $request)
     {
         return $request->user();
@@ -133,33 +262,26 @@ class AuthController extends Controller
      */
     protected function mapPadronToUserAttributes(SocioPadron $pad, string $dni, string $plainPassword): array
     {
-        // apynom viene "APELLIDO NOMBRE" (todo junto)
         $name = $pad->apynom ?: $dni;
 
         return [
             'dni'        => $dni,
             'name'       => $name,
-            'email'      => null, // si no lo tenés en padrón
+            'email'      => null,
 
-            // si tu tabla users tiene estos campos (los tenías ya):
             'nombre'     => null,
             'apellido'   => null,
 
             'socio_id'   => !empty($pad->sid) ? (string)$pad->sid : null,
             'barcode'    => !empty($pad->barcode) ? (string)$pad->barcode : null,
 
-            // si existieran en users y te sirven
-            // 'saldo'    => $pad->saldo,
-            // 'semaforo' => $pad->semaforo,
+            'api_update_ts' => now(),
 
-            'api_update_ts' => now(), // o null si preferís
-'password' => Hash::make($dni), // password inicial = DNI
+            // ✅ password inicial = DNI (NO usa $plainPassword)
+            'password'      => Hash::make($dni),
         ];
     }
 
-    /**
-     * Completa un User ya existente con datos del padrón local si faltan.
-     */
     protected function fillFromPadronIfMissing(User $user, SocioPadron $pad): void
     {
         $changed = false;
@@ -184,9 +306,6 @@ class AuthController extends Controller
         }
     }
 
-    /**
-     * Mezcla attrs con una row de padrón (por si venís de API)
-     */
     protected function mergeAttrsFromPadronRow(array $attrs, SocioPadron $pad, string $dni): array
     {
         if (($attrs['name'] ?? $dni) === $dni && !empty($pad->apynom)) {
@@ -204,10 +323,6 @@ class AuthController extends Controller
         return $attrs;
     }
 
-    /**
-     * ======== API -> USER (fallback) ========
-     * (tu método original, lo dejo casi igual)
-     */
     protected function mapSocioToUserAttributes(array $socio, string $dni, ?string $plainPassword, bool $isNew = true): array
     {
         $nombre   = trim((string)($socio['nombre'] ?? ''));
@@ -239,16 +354,14 @@ class AuthController extends Controller
             'api_update_ts'=> ($socio['update_ts'] ?? null) ? Carbon::parse($socio['update_ts']) : now(),
         ];
 
-        if ($isNew && $plainPassword !== null) {
-            $attrs['password'] = Hash::make($plainPassword);
+        // ✅ password inicial = DNI (NO usa $plainPassword)
+        if ($isNew) {
+            $attrs['password'] = Hash::make($dni);
         }
 
         return $attrs;
     }
 
-    /**
-     * Descarga la imagen del socio y la guarda en /storage/app/public/socios/{id}.jpg
-     */
     protected function downloadAndStoreAvatar(SociosApi $api, string $socioId): ?string
     {
         if ($socioId === '') return null;
@@ -258,6 +371,7 @@ class AuthController extends Controller
             Storage::disk('public')->put($file, $binary);
             return "storage/{$file}";
         }
+
         return null;
     }
 }

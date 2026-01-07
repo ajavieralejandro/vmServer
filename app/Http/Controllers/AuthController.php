@@ -153,7 +153,7 @@ class AuthController extends Controller
             // 'semaforo' => $pad->semaforo,
 
             'api_update_ts' => now(), // o null si preferís
-            'password'      => Hash::make($plainPassword),
+'password' => Hash::make($dni), // password inicial = DNI
         ];
     }
 
